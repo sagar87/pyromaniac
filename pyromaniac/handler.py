@@ -226,7 +226,7 @@ class SVIModel(SVIHandler):
         if len(predictive_kwargs) == 0:
             predictive_kwargs["return_sites"] = tuple(self._latent_variables)
 
-        self.fit(self, predictive_kwargs=predictive_kwargs, *args, **kwargs)
+        super().fit(self, predictive_kwargs=predictive_kwargs, *args, **kwargs)
 
         if deterministic:
             self.deterministic()
