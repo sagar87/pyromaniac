@@ -196,3 +196,40 @@ class SVIHandler(Handler):
 
     def load_params(self, file_name):
         self.params = pickle.load(open(file_name, "rb"))
+
+
+class SVIModel(SVIHandler):
+    """
+    Abstract class of the SVI handler. To be used classes that implement
+    a numpyro model and guide.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(self.model, self.guide, **kwargs)
+
+    @property
+    def _latent_variables(self):
+        """
+        Returns the latent variables of the model.
+        """
+        raise NotImplementedError()
+
+    def model(self):
+        raise NotImplementedError()
+
+    def guide(self):
+        raise NotImplementedError()
+
+    def fit(
+        self, predictive_kwargs: dict = {}, deterministic: bool = True, *args, **kwargs
+    ):
+        if len(predictive_kwargs) == 0:
+            predictive_kwargs["return_sites"] = tuple(self._latent_variables)
+
+        self.fit(self, predictive_kwargs=predictive_kwargs, *args, **kwargs)
+
+        if deterministic:
+            self.deterministic()
+
+    def deterministic(self):
+        pass
