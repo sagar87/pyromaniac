@@ -189,10 +189,6 @@ class SVIHandler(Handler):
                     if improvement > 0:
                         best_elbo = current_elbo
 
-                # register training hooks
-
-                # self._register_param_hook()
-
                 if self.dev:
                     self._track_learning_rate()
 
