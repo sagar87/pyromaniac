@@ -91,7 +91,11 @@ class Posterior(object):
     def quantiles(self, param, *args, **kwargs):
         """Returns the quantiles of param."""
         q = kwargs.pop("q", [0.025, 0.975])
-        return np.quantile(self.dist(param, *args), q, axis=0,)
+        return np.quantile(
+            self.dist(param, *args),
+            q,
+            axis=0,
+        )
 
     def qlower(self, param, *args, **kwargs):
         """Returns the quantile lower bound of param."""
