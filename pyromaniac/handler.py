@@ -52,21 +52,25 @@ class SVIHandler(Handler):
         loss: Trace_ELBO = pyro.infer.Trace_ELBO,
         optimizer=torch.optim.Adam,
         scheduler=pyro.optim.ReduceLROnPlateau,
-        lr: float = 0.001,
-        rng_key: int = 254,
+        seed=None,
         num_epochs: int = 30000,
         num_samples: int = 1000,
-        log_freq=10,
+        log_freq: int = 10,
+        checkpoint_freq: int = 500,
+        dev=True,
         to_numpy: bool = True,
-        optimizer_kwargs: dict = {"lr": 1e-3},
+        optimizer_kwargs: dict = {"lr": 1e-2},
         scheduler_kwargs: dict = {"factor": 0.99},
         loss_kwargs: dict = {"num_particles": 1},
     ):
         pyro.clear_param_store()
+        if seed is not None:
+            pyro.set_rng_seed(seed)
         self.model = model
         self.guide = guide
         self.loss = loss(**loss_kwargs)
         self.scheduler = False if scheduler is None else True
+        self.seed = seed
 
         if self.scheduler:
             self.optimizer = scheduler(
@@ -79,79 +83,156 @@ class SVIHandler(Handler):
         else:
             self.optimizer = optimizer(optimizer_kwargs)
 
-        self.svi = SVI(self.model, self.guide, self.optimizer, loss=self.loss)
+        self.svi = self._init_svi()
         self.init_state = None
 
         self.log_freq = log_freq
+        self.checkpoint_freq = checkpoint_freq
+        self.log_learning_rates = defaultdict(list)
+        self.log_gradient_norms = defaultdict(list)
+        self.log_parameter_vals = defaultdict(list)
+        self.checkpoints = {}
         self.num_epochs = num_epochs
         self.num_samples = num_samples
 
         self.loss = None
         self.to_numpy = to_numpy
         self.steps = 0
+        self.dev = dev
 
-        self._register_gradient_hook()
+    def _update_state(self, loss):
+        self.loss = loss if self.loss is None else np.concatenate([self.loss, loss])
+
+    def _init_svi(self):
+        """
+        Initialises the SVI.
+        """
+        return SVI(self.model, self.guide, self.optimizer, loss=self.loss)
+
+    def _set_lr(self, lr):
+        # this works for CLIPPED adam
+        # checl if optim_objs is presetn
+        if hasattr(self.optimizer, "optim_objs"):
+            for opt in self.optimizer.optim_objs.values():
+                for group in opt.param_groups:
+                    group["lr"] = lr
+        else:
+            pass
+            # for group in self.optimizer.optim_objs.values():
+            #     group['lr'] = lr
+
+    def _get_learning_rate(self):
+        """
+        Extracts the learning rate from the first parameter.
+        TODO: return a dict(lr: [params])
+        """
+        for name, param in self.optimizer.get_state().items():
+            if "optimizer" in param:
+                lr = param["optimizer"]["param_groups"][0]["lr"]
+            else:
+                lr = param["param_groups"][0]["lr"]
+            break
+        return lr
+
+    def _get_param_store(self):
+        return {
+            k: v.detach().cpu().numpy() for k, v in dict(pyro.get_param_store()).items()
+        }
+
+    def _track_learning_rate(self):
+        """
+        Tracks the learning rate during training.
+        """
+        for name, param in self.optimizer.get_state().items():
+            if "optimizer" in param:
+                self.log_learning_rates[name].append(
+                    param["optimizer"]["param_groups"][0]["lr"]
+                )
+            else:
+                self.log_learning_rates[name].append(param["param_groups"][0]["lr"])
+
+    def initialize(self, seed):
+        pyro.set_rng_seed(seed)
+        pyro.clear_param_store()
+        self._init_svi()
+        return self.svi.step()
 
     def _register_gradient_hook(self):
         # Register hooks to monitor gradient norms.
-        self.gradient_norms = defaultdict(list)
+
         for name, value in pyro.get_param_store().named_parameters():
             value.register_hook(
-                lambda g, name=name: self.gradient_norms[name].append(g.norm().item())
+                lambda g, name=name: self.log_gradient_norms[name].append(
+                    g.norm().item()
+                )
             )
 
     def _fit(self, *args, **kwargs):
         losses = []
         pbar = tqdm(range(self.steps, self.steps + self.num_epochs))
+        failure = False
+
         previous_elbo = 0
+        best_elbo = np.inf
         delta = 0
-        for i in pbar:
-            current_elbo = self.svi.step(*args, **kwargs)
-            losses.append(current_elbo)
 
-            if i % self.log_freq == 0:
+        try:
+            for i in pbar:
+                current_elbo = self.svi.step(*args, **kwargs)
+                losses.append(current_elbo)
+
+                if i == 0:
+                    self._register_gradient_hook()
+                    best_elbo = current_elbo
+                else:
+                    improvement = best_elbo - current_elbo
+                    if improvement > 0:
+                        best_elbo = current_elbo
+
+                # register training hooks
+
+                # self._register_param_hook()
+
+                if self.dev:
+                    self._track_learning_rate()
+
+                if i % self.log_freq == 0:
+                    lr = self._get_learning_rate()
+                    pbar.set_description(
+                        f"Epoch: {i} | lr: {lr:.2E} | ELBO: {current_elbo:.0f} | Δ_{self.log_freq}: {delta:.2f} | Best: {best_elbo:.0f}"
+                    )
+                    if i > 0:
+                        delta = previous_elbo - current_elbo
+                    previous_elbo = current_elbo
+
+                if i % self.checkpoint_freq == 0:
+                    self.checkpoints[i] = self._get_param_store()
+
                 if self.scheduler:
-                    # lr = self.optimizer.get_last_lr()
-                    for k, v in self.optimizer.get_state().items():
-                        lr = v["optimizer"]["param_groups"][0]["lr"]
-                        break
-                    pbar.set_description(
-                        f"It: {i} | lr: {lr:.6f} | ELBO {current_elbo:.2f} | Δ_{self.log_freq} {delta:.2f}"
-                    )
-                else:
-                    pbar.set_description(
-                        f"It: {i} | ELBO {current_elbo:.2f} | Δ_{self.log_freq} {delta:.2f}"
-                    )
-                delta = previous_elbo - current_elbo
-                previous_elbo = current_elbo
+                    if issubclass(
+                        self.optimizer.pt_scheduler_constructor,
+                        torch.optim.lr_scheduler.ReduceLROnPlateau,
+                    ):
+                        self.optimizer.step(current_elbo)
+                    else:
+                        self.optimizer.step()
+        except KeyboardInterrupt:
+            # TODO: use warning
+            print("Stoping training ...")
+            failure = True
 
-            if self.scheduler:
-                if issubclass(
-                    self.optimizer.pt_scheduler_constructor,
-                    torch.optim.lr_scheduler.ReduceLROnPlateau,
-                ):
-                    self.optimizer.step(current_elbo)
-                else:
-                    self.optimizer.step()
-
-        self.steps += self.num_epochs
+        if failure:
+            self.steps += i
+        else:
+            self.steps += self.num_epochs
 
         return losses
 
-    def _update_state(self, loss):
-        self.loss = loss if self.loss is None else np.concatenate([self.loss, loss])
-
     def fit(self, *args, **kwargs):
         self.num_epochs = kwargs.pop("num_epochs", self.num_epochs)
-
-        # reset learning rates
-        #         lr = kwargs.pop("lr", None)
-        #         if lr is not None:
-        #             state = self.optimizer.get_state()
-        #             for k, v in state.items():
-        #                 v['param_groups'][0]['lr'] = lr
-
-        #             self.optimizer.set_state(state)
+        lr = kwargs.pop("lr", None)
+        if lr is not None:
+            self._set_lr(lr)
         predictive_kwargs = kwargs.pop("predictive_kwargs", {})
 
         # if self.init_state is None:
@@ -159,9 +240,7 @@ class SVIHandler(Handler):
 
         loss = self._fit(*args, **kwargs)
         self._update_state(loss)
-        self.params = {
-            k: v.detach().cpu().numpy() for k, v in dict(pyro.get_param_store()).items()
-        }
+        self.params = self._get_param_store()
 
         predictive = Predictive(
             self.model,
