@@ -86,12 +86,6 @@ class Posterior(object):
         """Returns the mean of param."""
         return np.mean(self.dist(param, *args), axis=0)
 
-    # @ignore_unhashable
-    # @functools.lru_cache(maxsize=128)
-    # def hpdi(self, param, *args, **kwargs):
-    #     """Returns the highest predictive density interval of param."""
-    #     return hpdi(self.dist(param, *args), **kwargs)
-
     @ignore_unhashable
     @functools.lru_cache(maxsize=128)
     def quantiles(self, param, *args, **kwargs):
@@ -106,14 +100,6 @@ class Posterior(object):
     def qupper(self, param, *args, **kwargs):
         """Returns the quantile upper bound of param."""
         return self.quantiles(param, *args, **kwargs)[1]
-
-    # def lower(self, param, *args, **kwargs):
-    #     """Returns the HPDI lower bound of param."""
-    #     return self.hpdi(param, *args, **kwargs)[0]
-
-    # def upper(self, param, *args, **kwargs):
-    #     """Returns the HPDI upper bound of param."""
-    #     return self.hpdi(param, *args, **kwargs)[1]
 
     def ci(self, param, *args, **kwargs):
         return np.abs(self.mean(param, *args) - self.hpdi(param, *args, **kwargs))
