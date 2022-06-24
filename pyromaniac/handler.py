@@ -58,6 +58,7 @@ class SVIHandler(Handler):
         log_freq: int = 10,
         checkpoint_freq: int = 500,
         dev=True,
+        run_predictive=True,
         to_numpy: bool = True,
         optimizer_kwargs: dict = {"lr": 1e-2},
         scheduler_kwargs: dict = {"factor": 0.99},
@@ -99,6 +100,7 @@ class SVIHandler(Handler):
         self.to_numpy = to_numpy
         self.steps = 0
         self.dev = dev
+        self.run_predictive = run_predictive
 
     def _update_state(self, loss):
         self.loss = loss if self.loss is None else np.concatenate([self.loss, loss])
@@ -238,17 +240,18 @@ class SVIHandler(Handler):
         self._update_state(loss)
         self.params = self._get_param_store()
 
-        predictive = Predictive(
-            self.model,
-            guide=self.guide,
-            num_samples=self.num_samples,
-            **predictive_kwargs,
-        )
+        if self.run_predictive:
+            predictive = Predictive(
+                self.model,
+                guide=self.guide,
+                num_samples=self.num_samples,
+                **predictive_kwargs,
+            )
 
-        self.posterior = Posterior(
-            {k: v for k, v in predictive(*args, **kwargs).items()},
-            to_numpy=self.to_numpy,
-        )
+            self.posterior = Posterior(
+                {k: v for k, v in predictive(*args, **kwargs).items()},
+                to_numpy=self.to_numpy,
+            )
 
     def predict(self, *args, **kwargs):
         """kwargs -> Predictive, args -> predictive"""
