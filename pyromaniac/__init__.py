@@ -2,6 +2,7 @@
 Pyromaniac
 ==========
 """
-from .handler import SVIHandler, SVIModel
+from .handler import SVIBaseHandler
+from .local_handler import SVILocalHandler
 
-__all__ = ["SVIHandler", "SVIModel"]
+__all__ = ["SVIBaseHandler", "SVILocalHandler"]

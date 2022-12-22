@@ -1,4 +1,3 @@
-import pickle
 from collections import defaultdict
 
 import numpy as np
@@ -7,28 +6,8 @@ import torch
 from pyro.infer import SVI, Predictive, Trace_ELBO
 from tqdm import tqdm
 
-from pyromaniac.posterior import Posterior
 
-
-class Handler(object):
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def fit(self):
-        raise NotImplementedError
-
-    def predict(self):
-        raise NotImplementedError
-
-    def dump_posterior(self, file_name: str):
-        assert self.posterior is not None, "'init_svi' needs to be called first"
-        pickle.dump(self.posterior.data, open(file_name, "wb"))
-
-    def load_posterior(self, file_name):
-        self.posterior = Posterior(pickle.load(open(file_name, "rb")))
-
-
-class SVIHandler(Handler):
+class SVIBaseHandler:
     """
     Helper object that abstracts some of numpyros complexities. Inspired
     by an implementation of Florian Wilhelm.
@@ -49,16 +28,13 @@ class SVIHandler(Handler):
         self,
         model,
         guide,
-        loss: Trace_ELBO = pyro.infer.Trace_ELBO,
+        loss: Trace_ELBO = pyro.infer.TraceMeanField_ELBO,
         optimizer=torch.optim.Adam,
         scheduler=pyro.optim.ReduceLROnPlateau,
         seed=None,
         num_epochs: int = 30000,
-        num_samples: int = 1000,
         log_freq: int = 10,
-        checkpoint_freq: int = 500,
-        dev=True,
-        run_predictive=True,
+        checkpoint_freq: int = -1,
         to_numpy: bool = True,
         optimizer_kwargs: dict = {"lr": 1e-2},
         scheduler_kwargs: dict = {"factor": 0.99},
@@ -85,25 +61,24 @@ class SVIHandler(Handler):
             self.optimizer = optimizer(optimizer_kwargs)
 
         self.svi = self._init_svi()
-        self.init_state = None
-
         self.log_freq = log_freq
         self.checkpoint_freq = checkpoint_freq
-        self.log_learning_rates = defaultdict(list)
-        self.log_gradient_norms = defaultdict(list)
-        self.log_parameter_vals = defaultdict(list)
+        self.learning_rates = defaultdict(list)
+        self.gradient_norms = defaultdict(list)
+
         self.checkpoints = {}
         self.num_epochs = num_epochs
-        self.num_samples = num_samples
 
         self.loss = None
         self.to_numpy = to_numpy
+        self.best_elbo = None
         self.steps = 0
-        self.dev = dev
-        self.run_predictive = run_predictive
 
     def _update_state(self, loss):
         self.loss = loss if self.loss is None else np.concatenate([self.loss, loss])
+
+    def _to_numpy(self, posterior):
+        return {k: v.detach().cpu().numpy() for k, v in posterior.items()}
 
     def _init_svi(self):
         """
@@ -136,37 +111,24 @@ class SVIHandler(Handler):
             break
         return lr
 
-    def _get_param_store(self):
-        return {
-            k: v.detach().cpu().numpy() for k, v in dict(pyro.get_param_store()).items()
-        }
-
     def _track_learning_rate(self):
         """
         Tracks the learning rate during training.
         """
         for name, param in self.optimizer.get_state().items():
             if "optimizer" in param:
-                self.log_learning_rates[name].append(
+                self.learning_rates[name].append(
                     param["optimizer"]["param_groups"][0]["lr"]
                 )
             else:
-                self.log_learning_rates[name].append(param["param_groups"][0]["lr"])
+                self.learning_rates[name].append(param["param_groups"][0]["lr"])
 
-    def initialize(self, seed):
-        pyro.set_rng_seed(seed)
-        pyro.clear_param_store()
-        self._init_svi()
-        return self.svi.step()
-
-    def _register_gradient_hook(self):
+    def _track_gradient_norms(self):
         # Register hooks to monitor gradient norms.
 
         for name, value in pyro.get_param_store().named_parameters():
             value.register_hook(
-                lambda g, name=name: self.log_gradient_norms[name].append(
-                    g.norm().item()
-                )
+                lambda g, name=name: self.gradient_norms[name].append(g.norm().item())
             )
 
     def _fit(self, *args, **kwargs):
@@ -175,7 +137,7 @@ class SVIHandler(Handler):
         failure = False
 
         previous_elbo = 0
-        best_elbo = np.inf
+        best_elbo = np.inf if self.best_elbo is None else self.best_elbo
         delta = 0
 
         try:
@@ -184,15 +146,12 @@ class SVIHandler(Handler):
                 losses.append(current_elbo)
 
                 if i == 0:
-                    self._register_gradient_hook()
+                    self._track_gradient_norms()
                     best_elbo = current_elbo
                 else:
                     improvement = best_elbo - current_elbo
                     if improvement > 0:
                         best_elbo = current_elbo
-
-                if self.dev:
-                    self._track_learning_rate()
 
                 if i % self.log_freq == 0:
                     lr = self._get_learning_rate()
@@ -203,8 +162,8 @@ class SVIHandler(Handler):
                         delta = previous_elbo - current_elbo
                     previous_elbo = current_elbo
 
-                if i % self.checkpoint_freq == 0:
-                    self.checkpoints[i] = self._get_param_store()
+                if self.checkpoint_freq > 0 and i % self.checkpoint_freq == 0:
+                    self.checkpoints[i] = pyro.get_param_store().get_state()
 
                 if self.scheduler:
                     if issubclass(
@@ -214,6 +173,7 @@ class SVIHandler(Handler):
                         self.optimizer.step(current_elbo)
                     else:
                         self.optimizer.step()
+
         except KeyboardInterrupt:
             # TODO: use warning
             print("Stoping training ...")
@@ -224,6 +184,9 @@ class SVIHandler(Handler):
         else:
             self.steps += self.num_epochs
 
+        # update max elbo
+        self.best_elbo = best_elbo
+
         return losses
 
     def fit(self, *args, **kwargs):
@@ -231,83 +194,22 @@ class SVIHandler(Handler):
         lr = kwargs.pop("lr", None)
         if lr is not None:
             self._set_lr(lr)
-        predictive_kwargs = kwargs.pop("predictive_kwargs", {})
-
-        # if self.init_state is None:
-        #     self.init_state = self.svi.init(self.rng_key, *args)
 
         loss = self._fit(*args, **kwargs)
         self._update_state(loss)
-        self.params = self._get_param_store()
+        self.params = pyro.get_param_store().get_state()
 
-        if self.run_predictive:
-            predictive = Predictive(
-                self.model,
-                guide=self.guide,
-                num_samples=self.num_samples,
-                **predictive_kwargs,
-            )
-
-            self.posterior = Posterior(
-                {k: v for k, v in predictive(*args, **kwargs).items()},
-                to_numpy=self.to_numpy,
-            )
-
-    def predict(self, *args, **kwargs):
+    def predict(self, return_sites, num_samples=25, *args, **kwargs):
+        if self.params is not None:
+            pyro.clear_param_store()
+            pyro.get_param_store().set_state(self.params)
         """kwargs -> Predictive, args -> predictive"""
-        num_samples = kwargs.pop("num_samples", self.num_samples)
-        # rng_key = kwargs.pop("rng_key", self.rng_key)
-
         predictive = Predictive(
             self.model,
             guide=self.guide,
-            # posterior_samples=self.params,
             num_samples=num_samples,
-            **kwargs,
+            return_sites=return_sites,
         )
-
-        self.predictive = Posterior(predictive(*args), self.to_numpy)
-
-    def dump_params(self, file_name: str):
-        assert self.params is not None, "'init_svi' needs to be called first"
-        pickle.dump(self.params, open(file_name, "wb"))
-
-    def load_params(self, file_name):
-        self.params = pickle.load(open(file_name, "rb"))
-
-
-class SVIModel(SVIHandler):
-    """
-    Abstract class of the SVI handler. To be used classes that implement
-    a numpyro model and guide.
-    """
-
-    def __init__(self, **kwargs):
-        super().__init__(self.model, self.guide, **kwargs)
-
-    @property
-    def _latent_variables(self):
-        """
-        Returns the latent variables of the model.
-        """
-        raise NotImplementedError()
-
-    def model(self):
-        raise NotImplementedError()
-
-    def guide(self):
-        raise NotImplementedError()
-
-    def fit(
-        self, predictive_kwargs: dict = {}, deterministic: bool = True, *args, **kwargs
-    ):
-        if len(predictive_kwargs) == 0:
-            predictive_kwargs["return_sites"] = tuple(self._latent_variables)
-
-        super().fit(self, predictive_kwargs=predictive_kwargs, *args, **kwargs)
-
-        if deterministic:
-            self.deterministic()
-
-    def deterministic(self):
-        pass
+        posterior = predictive(*args, **kwargs)
+        self.posterior = self._to_numpy(posterior) if self.to_numpy else posterior
+        torch.cuda.empty_cache()
