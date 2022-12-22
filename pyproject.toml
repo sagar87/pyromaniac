@@ -8,8 +8,8 @@ description = "Helper modules for pyro."
 authors = ["Harald Vohringer"]
 
 [tool.poetry.dependencies]
-python = "^3.8"
-pyro-ppl = "^1.8.0"
+python = ">=3.8.1,<3.11"
+pyro-ppl = ">=1.8.0"
 
 [tool.poetry.dev-dependencies]
 pytest = "^7.1.2"
